@@ -36,7 +36,7 @@ the upstream container.
 docker build -t file-centipede-auto-activate:local .
 ```
 
-The default base is the tested `jlesage/file-centipede:26.03.1`. To test a newer
+The default base is `jlesage/file-centipede:v26.07.2`. To test a newer
 base explicitly:
 
 ```sh

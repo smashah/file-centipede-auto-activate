@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=jlesage/file-centipede:26.03.1
+ARG BASE_IMAGE=jlesage/file-centipede:v26.07.2
 FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.source="https://github.com/smashah/file-centipede-auto-activate" \
