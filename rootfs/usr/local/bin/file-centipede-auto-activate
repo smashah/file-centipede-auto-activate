@@ -1,0 +1,160 @@
+#!/bin/sh
+
+set -u
+
+CODE_URL="${AUTO_ACTIVATE_CODE_URL:-https://raw.githubusercontent.com/filecxx/FileCentipede/main/en_US/activation_code.html}"
+POLL_SECONDS="${AUTO_ACTIVATE_POLL_SECONDS:-10}"
+RETRY_SECONDS="${AUTO_ACTIVATE_RETRY_SECONDS:-300}"
+
+log() {
+    printf '%s\n' "[file-centipede-auto-activate] $*"
+}
+
+read_lang_value() {
+    key="$1"
+    file="$2"
+    sed -n "s/^${key}=//p" "$file" | head -n 1 | tr -d '\r'
+}
+
+activation_window_title() {
+    lang=en_US
+    if [ -f /config/fileu_linux.conf ]; then
+        configured_lang="$(sed -n 's/.*"lang":"\([^"]*\)".*/\1/p' /config/fileu_linux.conf | head -n 1)"
+        [ -z "$configured_lang" ] || lang="$configured_lang"
+    fi
+
+    lang_file="/opt/filecentipede/lang/${lang}.lang"
+    [ -f "$lang_file" ] || lang_file=/opt/filecentipede/lang/en_US.lang
+
+    app_name="$(read_lang_value software_name_ "$lang_file")"
+    activation_label="$(read_lang_value activation_code "$lang_file")"
+    [ -n "$app_name" ] || app_name='File Centipede'
+    [ -n "$activation_label" ] || activation_label='Activation code'
+
+    printf '%s - %s\n' "$app_name" "$activation_label"
+}
+
+find_activation_window() {
+    wanted_title="$1"
+
+    for window_id in $(xdotool search --onlyvisible --name '.*' 2>/dev/null || true); do
+        title="$(xdotool getwindowname "$window_id" 2>/dev/null || true)"
+        [ "$title" = "$wanted_title" ] || continue
+
+        geometry="$(xdotool getwindowgeometry --shell "$window_id" 2>/dev/null || true)"
+        width="$(printf '%s\n' "$geometry" | sed -n 's/^WIDTH=//p')"
+        height="$(printf '%s\n' "$geometry" | sed -n 's/^HEIGHT=//p')"
+
+        # The upstream activation dialog is fixed at 600x400. Refuse to click
+        # if the UI changes materially, so a future release fails safely.
+        [ -n "$width" ] && [ -n "$height" ] || continue
+        [ "$width" -ge 560 ] && [ "$width" -le 640 ] || continue
+        [ "$height" -ge 360 ] && [ "$height" -le 440 ] || continue
+
+        printf '%s|%s|%s\n' "$window_id" "$width" "$height"
+        return 0
+    done
+
+    return 1
+}
+
+fetch_active_code() {
+    now="$(date -u '+%Y-%m-%d %H:%M:%S')"
+    html="$(curl --fail --silent --show-error --location \
+        --connect-timeout 10 --max-time 30 \
+        --range 0-131071 "$CODE_URL")" || return 1
+
+    printf '%s\n' "$html" | awk -v now="$now" '
+        /<pre[^>]*id="codes"/ { in_codes = 1; next }
+        /<\/pre>/ { in_codes = 0 }
+        !in_codes { next }
+        {
+            line = $0
+            gsub(/<[^>]*>/, "", line)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+
+            if (line ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] - [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/) {
+                start = substr(line, 1, 19)
+                end = substr(line, 23, 19)
+                active = (start <= now && now < end)
+                next
+            }
+
+            if (active && length(line) >= 100 && line !~ /[^A-Za-z0-9_-]/) {
+                matches++
+                selected_start = start
+                selected_end = end
+                selected_code = line
+                active = 0
+            }
+        }
+        END {
+            if (matches == 1) {
+                print selected_start "|" selected_end "|" selected_code
+            }
+        }
+    '
+}
+
+apply_code() {
+    window_id="$1"
+    width="$2"
+    height="$3"
+    code="$4"
+
+    text_x=$((width / 2))
+    text_y=$((height * 38 / 100))
+    ok_x=$((width - 45))
+    ok_y=$((height - 25))
+
+    xdotool windowactivate --sync "$window_id" \
+        mousemove --window "$window_id" "$text_x" "$text_y" click 1 \
+        key --clearmodifiers ctrl+a \
+        type --clearmodifiers --delay 1 "$code" \
+        mousemove --window "$window_id" "$ok_x" "$ok_y" click 1
+}
+
+log "watching for the native activation dialog"
+
+while :; do
+    window_title="$(activation_window_title)"
+    window="$(find_activation_window "$window_title" 2>/dev/null || true)"
+    if [ -z "$window" ]; then
+        sleep "$POLL_SECONDS"
+        continue
+    fi
+
+    record="$(fetch_active_code 2>/dev/null || true)"
+    if [ -z "$record" ]; then
+        log "no unambiguous active code could be fetched; leaving the dialog untouched"
+        sleep "$RETRY_SECONDS"
+        continue
+    fi
+
+    start="${record%%|*}"
+    remainder="${record#*|}"
+    end="${remainder%%|*}"
+    code="${remainder#*|}"
+    fingerprint="$(printf '%s' "$code" | sha256sum | cut -c1-12)"
+
+    window_id="${window%%|*}"
+    dimensions="${window#*|}"
+    width="${dimensions%%|*}"
+    height="${dimensions#*|}"
+
+    log "applying public code ${fingerprint}, valid ${start} through ${end} UTC"
+    if ! apply_code "$window_id" "$width" "$height" "$code"; then
+        log "xdotool could not submit the code; leaving the dialog available for manual entry"
+        sleep "$RETRY_SECONDS"
+        continue
+    fi
+
+    sleep 5
+    if xdotool getwindowname "$window_id" >/dev/null 2>&1; then
+        log "the activation dialog did not close; manual entry may be required"
+        sleep "$RETRY_SECONDS"
+    else
+        log "the activation dialog closed after submission"
+        sleep 60
+    fi
+done
